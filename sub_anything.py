@@ -164,11 +164,39 @@ def chunk_audio(audio_path: Path, output_dir: Path, chunk_duration: int = MAX_CH
 # Google Cloud Speech-to-Text Backend
 # ============================================================================
 
-def upload_to_gcs(local_path: Path, bucket_name: str, blob_name: str) -> str:
-    """Upload file to GCS and return gs:// URI."""
+def bucket_exists(bucket_name: str) -> bool:
+    """Check if a GCS bucket exists."""
     from google.cloud import storage
     client = storage.Client()
     bucket = client.bucket(bucket_name)
+    return bucket.exists()
+
+
+def create_bucket(bucket_name: str, location: str = "us-central1") -> bool:
+    """Create a GCS bucket. Returns True if successful."""
+    from google.cloud import storage
+    client = storage.Client()
+    try:
+        bucket = client.create_bucket(bucket_name, location=location)
+        print(f"Created bucket: {bucket.name}")
+        return True
+    except Exception as e:
+        print(f"Failed to create bucket: {e}")
+        return False
+
+
+def upload_to_gcs(local_path: Path, bucket_name: str, blob_name: str) -> str:
+    """Upload file to GCS and return gs:// URI."""
+    from google.cloud import storage
+    from google.api_core import exceptions as google_exceptions
+
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+
+    # Check if bucket exists first
+    if not bucket.exists():
+        raise google_exceptions.NotFound(f"Bucket '{bucket_name}' does not exist. Run the tool again to reconfigure.")
+
     blob = bucket.blob(blob_name)
     blob.upload_from_filename(str(local_path))
     return f"gs://{bucket_name}/{blob_name}"
@@ -198,12 +226,28 @@ def transcribe_google(
     from google.cloud.speech_v2 import SpeechClient
     from google.cloud.speech_v2.types import cloud_speech
     from google.api_core import exceptions as google_exceptions
+    from google.api_core.client_options import ClientOptions
 
-    client = SpeechClient()
+    # Chirp 3 requires multi-region locations (us, eu); other models use regional endpoints
+    if model == "chirp_3":
+        location = "us"
+        client = SpeechClient(
+            client_options=ClientOptions(
+                api_endpoint="us-speech.googleapis.com"
+            )
+        )
+    else:
+        # For 'long' and other models, use us-central1
+        location = "us-central1"
+        client = SpeechClient(
+            client_options=ClientOptions(
+                api_endpoint=f"{location}-speech.googleapis.com"
+            )
+        )
 
-    recognizer_id = f"sub-anything-{uuid.uuid4().hex[:8]}"
-    parent = f"projects/{project_id}/locations/us-central1"
-    recognizer_path = f"{parent}/recognizers/{recognizer_id}"
+    # Use the special "_" recognizer for inline configuration (no pre-creation needed)
+    parent = f"projects/{project_id}/locations/{location}"
+    recognizer_path = f"{parent}/recognizers/_"
 
     # Build features - CRITICAL: enable_word_time_offsets for timestamps
     features = cloud_speech.RecognitionFeatures(
@@ -218,7 +262,7 @@ def transcribe_google(
         )
 
     config = cloud_speech.RecognitionConfig(
-        auto_decoding_config=cloud_speech.AutoDecodingConfig(),
+        auto_decoding_config=cloud_speech.AutoDetectDecodingConfig(),
         language_codes=language_codes,
         model=model,
         features=features,
@@ -689,6 +733,22 @@ def prompt_for_config() -> Config:
         print("\nA Google Cloud Storage bucket is required for temporary audio uploads.")
         print("The audio will be uploaded, transcribed, then deleted.")
         config.gcs_bucket = input("Enter your GCS bucket name: ").strip()
+
+    # Verify bucket exists or offer to create it
+    print(f"Checking bucket '{config.gcs_bucket}'...")
+    if not bucket_exists(config.gcs_bucket):
+        print(f"Bucket '{config.gcs_bucket}' does not exist.")
+        create = input("Create it now? [Y/n]: ").strip().lower()
+        if create in ("", "y", "yes"):
+            if not create_bucket(config.gcs_bucket):
+                print("Could not create bucket. Please create it manually in Google Cloud Console.")
+                print("https://console.cloud.google.com/storage/browser")
+                sys.exit(1)
+        else:
+            print("Please create the bucket manually or run again with a different bucket name.")
+            sys.exit(1)
+    else:
+        print(f"Bucket '{config.gcs_bucket}' verified.")
 
     config.save()
     print(f"Configuration saved to {CONFIG_FILE}")

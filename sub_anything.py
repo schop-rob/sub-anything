@@ -15,7 +15,6 @@ Usage:
 """
 
 import argparse
-import base64
 import json
 import os
 import shutil
@@ -310,6 +309,54 @@ def transcribe_google(
 
     # Parse results - extract word-level timestamps
     segments = []
+    last_result_end_time = 0.0
+
+    def group_words_into_segments(
+        words: list[dict],
+        confidence: float,
+        language: Optional[str],
+    ) -> list[TranscriptSegment]:
+        grouped_segments: list[TranscriptSegment] = []
+
+        current_words: list[dict] = []
+        current_start: Optional[float] = None
+
+        for word in words:
+            if current_start is None:
+                current_start = word["start"]
+
+            current_words.append(word)
+
+            # Create segment every ~10 words or on sentence-ending punctuation
+            if len(current_words) >= 10 or word["word"].rstrip().endswith((".", "!", "?", "。", "！", "？")):
+                text = " ".join(w["word"] for w in current_words)
+                grouped_segments.append(
+                    TranscriptSegment(
+                        start_time=current_start,
+                        end_time=current_words[-1]["end"],
+                        text=text.strip(),
+                        confidence=confidence,
+                        speaker=current_words[0].get("speaker"),
+                        language=language,
+                    )
+                )
+                current_words = []
+                current_start = None
+
+        if current_words:
+            text = " ".join(w["word"] for w in current_words)
+            grouped_segments.append(
+                TranscriptSegment(
+                    start_time=current_start if current_start is not None else current_words[0]["start"],
+                    end_time=current_words[-1]["end"],
+                    text=text.strip(),
+                    confidence=confidence,
+                    speaker=current_words[0].get("speaker"),
+                    language=language,
+                )
+            )
+
+        return grouped_segments
 
     for file_result in result.results.values():
         transcript = file_result.transcript
@@ -319,73 +366,108 @@ def transcribe_google(
                 continue
 
             alt = result_item.alternatives[0]
+            confidence = getattr(alt, "confidence", 0.9)
+            language = getattr(result_item, "language_code", None)
+
+            result_end_time: Optional[float] = None
+            if hasattr(result_item, "result_end_offset"):
+                result_end_time = result_item.result_end_offset.total_seconds()
 
             # Build segments from word-level timestamps when available
             if alt.words:
-                # Group words into subtitle-sized segments (roughly 10 words or natural pauses)
-                current_words = []
-                current_start = None
+                # Chirp can occasionally return words without usable timestamps.
+                # If timing looks collapsed (e.g., many 0-length words or word offsets don't reach the
+                # result_end_offset), fall back to interpolating word timings across the result window.
+                words: list[dict] = []
+                valid_timing_count = 0
+                min_start: Optional[float] = None
+                max_end: Optional[float] = None
 
                 for word_info in alt.words:
                     word = word_info.word
                     start = word_info.start_offset.total_seconds()
                     end = word_info.end_offset.total_seconds()
-                    speaker = getattr(word_info, 'speaker_label', None)
+                    speaker = getattr(word_info, "speaker_label", None) or getattr(word_info, "speaker_tag", None)
 
-                    if current_start is None:
-                        current_start = start
+                    if end > start:
+                        valid_timing_count += 1
+                        min_start = start if min_start is None else min(min_start, start)
+                        max_end = end if max_end is None else max(max_end, end)
 
-                    current_words.append({
-                        'word': word,
-                        'start': start,
-                        'end': end,
-                        'speaker': speaker
-                    })
+                    words.append(
+                        {
+                            "word": word,
+                            "start": start,
+                            "end": end,
+                            "speaker": speaker,
+                        }
+                    )
 
-                    # Create segment every ~10 words or on sentence-ending punctuation
-                    if len(current_words) >= 10 or word.rstrip().endswith(('.', '!', '?', '。', '！', '？')):
-                        text = ' '.join(w['word'] for w in current_words)
-                        segments.append(TranscriptSegment(
-                            start_time=current_start,
-                            end_time=current_words[-1]['end'],
-                            text=text.strip(),
-                            confidence=getattr(alt, 'confidence', 0.9),
-                            speaker=current_words[0].get('speaker'),
-                            language=getattr(result_item, 'language_code', None)
-                        ))
-                        current_words = []
-                        current_start = None
+                timing_span = (max_end - min_start) if (min_start is not None and max_end is not None) else 0.0
+                unique_end_times = {round(w["end"], 3) for w in words}
 
-                # Don't forget remaining words
-                if current_words:
-                    text = ' '.join(w['word'] for w in current_words)
-                    segments.append(TranscriptSegment(
-                        start_time=current_start,
-                        end_time=current_words[-1]['end'],
-                        text=text.strip(),
-                        confidence=getattr(alt, 'confidence', 0.9),
-                        speaker=current_words[0].get('speaker'),
-                        language=getattr(result_item, 'language_code', None)
-                    ))
+                timing_collapsed = (
+                    len(words) >= 5
+                    and (
+                        valid_timing_count < max(2, int(len(words) * 0.3))
+                        or timing_span < 0.1
+                        or (len(unique_end_times) <= 2 and len(words) >= 20)
+                    )
+                )
+
+                if result_end_time is not None and max_end is not None:
+                    if max_end < result_end_time - 1.0:
+                        timing_collapsed = True
+
+                if timing_collapsed and result_end_time is not None:
+                    if verbose:
+                        print("  Warning: word timestamps missing/collapsed; interpolating timings (try --model long for guaranteed timestamps)")
+
+                    # Interpolate word timings across [last_result_end_time, result_end_time]
+                    window_start = last_result_end_time
+                    window_end = max(result_end_time, window_start + 0.01)
+                    duration = window_end - window_start
+                    per_word = duration / max(len(words), 1)
+
+                    for idx, w in enumerate(words):
+                        w["start"] = window_start + (idx * per_word)
+                        w["end"] = window_start + ((idx + 1) * per_word)
+
+                    segments.extend(group_words_into_segments(words, confidence=confidence, language=language))
+                    last_result_end_time = window_end
+                else:
+                    segments.extend(group_words_into_segments(words, confidence=confidence, language=language))
+                    if max_end is not None:
+                        last_result_end_time = max(last_result_end_time, max_end)
+                    if result_end_time is not None:
+                        last_result_end_time = max(last_result_end_time, result_end_time)
             else:
                 # Fallback: use segment-level timing
                 text = alt.transcript.strip()
                 if not text:
                     continue
 
-                start_time = 0.0
-                end_time = 0.0
+                start_time = last_result_end_time
+                end_time = start_time
 
-                if hasattr(result_item, 'result_end_offset'):
+                if result_end_time is not None:
+                    end_time = result_end_time
+                elif hasattr(result_item, "result_end_offset"):
+                    # Defensive (older clients may not hit the assignment above)
                     end_time = result_item.result_end_offset.total_seconds()
+
+                if end_time <= start_time:
+                    # Heuristic: assume ~15 chars/sec when timing is missing
+                    end_time = start_time + max(1.0, len(text) / 15.0)
 
                 segments.append(TranscriptSegment(
                     start_time=start_time,
                     end_time=end_time,
                     text=text,
-                    confidence=getattr(alt, 'confidence', 0.9),
-                    language=getattr(result_item, 'language_code', None)
+                    confidence=confidence,
+                    language=language
                 ))
+                last_result_end_time = max(last_result_end_time, end_time)
 
     return segments
 
@@ -411,58 +493,54 @@ def transcribe_whisperx(
     if verbose:
         print("  Uploading to Replicate...")
 
-    # Read and encode audio file
-    with open(audio_path, "rb") as f:
-        audio_data = f.read()
+    # NOTE: Do not inline base64 audio data in the JSON payload (can trigger HTTP 413).
+    # The Replicate Python client supports uploading file-like objects.
+    with open(audio_path, "rb") as audio_file:
+        input_params = {
+            "audio_file": audio_file,
+            "align_output": True,  # Critical for word-level timestamps
+            "batch_size": 64,
+        }
 
-    # Create a data URI for the audio
-    audio_uri = f"data:audio/wav;base64,{base64.b64encode(audio_data).decode()}"
+        if language and language != "auto":
+            input_params["language"] = language
 
-    input_params = {
-        "audio_file": audio_uri,
-        "align_output": True,  # Critical for word-level timestamps
-        "batch_size": 64,
-    }
-
-    if language and language != "auto":
-        input_params["language"] = language
-
-    if enable_diarization:
-        input_params["diarization"] = True
-        if hf_token:
-            input_params["huggingface_access_token"] = hf_token
-        else:
-            # Check for HF token in env
-            hf_env = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
-            if hf_env:
-                input_params["huggingface_access_token"] = hf_env
+        if enable_diarization:
+            input_params["diarization"] = True
+            if hf_token:
+                input_params["huggingface_access_token"] = hf_token
             else:
-                print("Warning: Diarization requested but no HuggingFace token provided.")
-                print("Set HF_TOKEN environment variable for speaker labels.")
-                input_params["diarization"] = False
+                # Check for HF token in env
+                hf_env = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+                if hf_env:
+                    input_params["huggingface_access_token"] = hf_env
+                else:
+                    print("Warning: Diarization requested but no HuggingFace token provided.")
+                    print("Set HF_TOKEN environment variable for speaker labels.")
+                    input_params["diarization"] = False
 
-    if verbose:
-        print("  Running WhisperX transcription...")
+        if verbose:
+            print("  Running WhisperX transcription...")
 
-    # Run the model
-    max_retries = 3
-    output = None
+        # Run the model
+        max_retries = 3
+        output = None
 
-    for attempt in range(max_retries):
-        try:
-            output = replicate.run(
-                "victor-upmeet/whisperx:84d2ad2d6194fe98a17d2b60bef1c7f910c46b2f6fd38996ca457afd9c8abfcb",
-                input=input_params
-            )
-            break
-        except Exception as e:
-            if attempt < max_retries - 1:
-                wait_time = (2 ** attempt) * 5
-                if verbose:
-                    print(f"  Error: {e}, retrying in {wait_time}s...")
-                time.sleep(wait_time)
-            else:
-                raise
+        for attempt in range(max_retries):
+            try:
+                output = replicate.run(
+                    "victor-upmeet/whisperx:84d2ad2d6194fe98a17d2b60bef1c7f910c46b2f6fd38996ca457afd9c8abfcb",
+                    input=input_params,
+                )
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait_time = (2 ** attempt) * 5
+                    if verbose:
+                        print(f"  Error: {e}, retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    raise
 
     if output is None:
         return []
@@ -613,77 +691,138 @@ def segments_to_srt(
     return "\n".join(srt_lines)
 
 
+def sanitize_segments(segments: list[TranscriptSegment], min_duration: float = 0.2) -> list[TranscriptSegment]:
+    """Ensure segments have non-negative, non-zero timestamps."""
+    sanitized: list[TranscriptSegment] = []
+    for seg in segments:
+        start = max(0.0, float(seg.start_time))
+        end = float(seg.end_time)
+        if end <= start:
+            end = start + min_duration
+
+        sanitized.append(
+            TranscriptSegment(
+                start_time=start,
+                end_time=end,
+                text=seg.text,
+                confidence=seg.confidence,
+                speaker=seg.speaker,
+                language=seg.language,
+            )
+        )
+
+    return sanitized
+
+
 def translate_segments(
     segments: list[TranscriptSegment],
     target_language: str,
     verbose: bool = False
 ) -> list[TranscriptSegment]:
     """Translate segments using OpenAI GPT with timing reflow."""
+    import httpx
     import openai
 
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise ValueError("OPENAI_API_KEY environment variable not set")
 
-    client = openai.OpenAI(api_key=api_key)
     translated = []
     batch_size = 20
+    base_url = os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE")
+    organization = os.environ.get("OPENAI_ORGANIZATION") or os.environ.get("OPENAI_ORG")
+    project = os.environ.get("OPENAI_PROJECT") or os.environ.get("OPENAI_PROJECT_ID")
 
-    for i in range(0, len(segments), batch_size):
-        batch = segments[i:i + batch_size]
-        texts = [f"{j}. {seg.text}" for j, seg in enumerate(batch)]
-        combined = "\n".join(texts)
+    # Work around openai<->httpx incompatibilities by providing our own httpx client.
+    with httpx.Client(timeout=120.0) as http_client:
+        client_kwargs: dict = {"api_key": api_key, "http_client": http_client}
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        if organization:
+            client_kwargs["organization"] = organization
+        if project:
+            client_kwargs["project"] = project
 
-        prompt = f"""Translate the following numbered lines to {target_language}.
+        try:
+            client = openai.OpenAI(**client_kwargs)
+        except TypeError:
+            client_kwargs.pop("project", None)
+            client = openai.OpenAI(**client_kwargs)
+
+        for i in range(0, len(segments), batch_size):
+            batch = segments[i:i + batch_size]
+            texts = [f"{j}. {seg.text}" for j, seg in enumerate(batch)]
+            combined = "\n".join(texts)
+
+            prompt = f"""Translate the following numbered lines to {target_language}.
 Keep the numbering format exactly. Only output the translations, one per line.
 Maintain the same tone and style.
 
 {combined}"""
 
-        try:
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3
-            )
-
-            result = response.choices[0].message.content.strip()
-            translated_lines = result.split("\n")
-
-            for j, seg in enumerate(batch):
-                trans_text = seg.text
-                for line in translated_lines:
-                    if line.startswith(f"{j}."):
-                        trans_text = line[len(f"{j}."):].strip()
+            try:
+                max_retries = 3
+                response = None
+                for attempt in range(max_retries):
+                    try:
+                        response = client.chat.completions.create(
+                            model="gpt-4o-mini",
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0.3,
+                        )
                         break
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            wait_time = (2 ** attempt) * 5
+                            if verbose:
+                                print(f"  OpenAI error: {e}, retrying in {wait_time}s...")
+                            time.sleep(wait_time)
+                            continue
+                        raise
 
-                # Reflow timing
-                orig_len = len(seg.text)
-                trans_len = len(trans_text)
-                duration = seg.end_time - seg.start_time
+                if response is None:
+                    raise RuntimeError("OpenAI returned no response")
 
-                if orig_len > 0 and trans_len > orig_len:
-                    ratio = min(trans_len / orig_len, 1.5)
-                    new_duration = duration * ratio
-                else:
-                    new_duration = duration
+                result = response.choices[0].message.content.strip()
+                translated_lines = result.split("\n")
 
-                translated.append(TranscriptSegment(
-                    start_time=seg.start_time,
-                    end_time=seg.start_time + new_duration,
-                    text=trans_text,
-                    confidence=seg.confidence,
-                    speaker=seg.speaker,
-                    language=target_language
-                ))
+                for j, seg in enumerate(batch):
+                    trans_text = seg.text
+                    for line in translated_lines:
+                        stripped = line.lstrip()
+                        prefixes = (f"{j}.", f"{j}:", f"{j})", f"{j} -")
+                        match_prefix = next((p for p in prefixes if stripped.startswith(p)), None)
+                        if match_prefix:
+                            trans_text = stripped[len(match_prefix):].strip()
+                            break
 
-                if verbose and seg.language:
-                    print(f"  [{seg.language}] -> [{target_language}]")
+                    # Reflow timing
+                    orig_len = len(seg.text)
+                    trans_len = len(trans_text)
+                    duration = seg.end_time - seg.start_time
 
-        except Exception as e:
-            if verbose:
-                print(f"  Translation error: {e}, keeping original")
-            translated.extend(batch)
+                    if orig_len > 0 and trans_len > orig_len:
+                        ratio = min(trans_len / orig_len, 1.5)
+                        new_duration = duration * ratio
+                    else:
+                        new_duration = duration
+
+                    translated.append(TranscriptSegment(
+                        start_time=seg.start_time,
+                        end_time=seg.start_time + new_duration,
+                        text=trans_text,
+                        confidence=seg.confidence,
+                        speaker=seg.speaker,
+                        language=target_language
+                    ))
+
+                    if verbose and seg.language:
+                        print(f"  [{seg.language}] -> [{target_language}]")
+
+            except Exception as e:
+                if verbose:
+                    print(f"  Translation error: {e}, keeping original")
+                translated.extend(batch)
 
     # Fix overlapping timestamps
     for i in range(1, len(translated)):
@@ -961,12 +1100,25 @@ Environment variables:
             print("Warning: No speech detected in audio")
             sys.exit(0)
 
+        # Basic timestamp sanity checks
+        if duration > 60 and len(segments) > 20:
+            zero_duration = sum(1 for s in segments if s.end_time <= s.start_time + 1e-3)
+            rounded_ends = {round(s.end_time, 3) for s in segments}
+            max_end = max(s.end_time for s in segments)
+
+            if zero_duration > 0 or (len(rounded_ends) <= 3 and max_end < duration * 0.2):
+                print("Warning: Detected collapsed/invalid timestamps in output.")
+                print("  Try rerunning with `--model long` (guaranteed timestamps) or `--model whisperx`.")
+
+        segments = sanitize_segments(segments)
+
         print(f"Found {len(segments)} subtitle segments")
 
         # Step 5: Translate if requested
         if args.translate:
             print(f"Translating to {args.translate}...")
             segments = translate_segments(segments, args.translate, verbose=args.verbose)
+            segments = sanitize_segments(segments)
 
         # Step 6: Generate SRT
         srt_content = segments_to_srt(segments)

@@ -1,0 +1,22 @@
+# sub-anything dependencies
+# Install with: pip install -r requirements.txt
+
+# Google Cloud Speech-to-Text V2 (for chirp3/long models)
+google-cloud-speech==2.27.0
+google-cloud-storage==2.18.2
+google-api-core==2.21.0
+
+# Replicate API (for whisperx model)
+replicate==0.32.1
+
+# OpenAI for translation
+openai==1.51.0
+
+# Progress bar
+tqdm==4.66.5
+
+# Required system dependency (not pip installable):
+# ffmpeg - Install via:
+#   macOS:   brew install ffmpeg
+#   Ubuntu:  sudo apt install ffmpeg
+#   Windows: choco install ffmpeg

@@ -1,0 +1,6 @@
+#!/bin/bash
+# Wrapper script for sub-anything
+# Symlink this to /usr/local/bin/sub-anything or add this directory to PATH
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec python3 "$SCRIPT_DIR/sub_anything.py" "$@"

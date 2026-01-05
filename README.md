@@ -126,10 +126,15 @@ sub-anything [OPTIONS] INPUT_FILE
 Options:
   -v, --verbose          Show detailed progress and debug info
   --model MODEL          Transcription model: chirp3, long, whisperx (default: chirp3)
+  --google-location LOC  Google Speech-to-Text location for chirp3/long (e.g., us, eu, asia-northeast1)
   --language LANG        Source language hint (default: auto)
   --translate LANG       Translate subtitles to target language
+  --translate-model      OpenAI model for --translate (default: gpt-4o-mini)
+  --translate-batch-size Subtitle segments per translation request (default: 20)
+  --save-original        When using --translate, also save the original transcript as *.orig.srt/.orig.txt
   --diarize              Enable speaker diarization
   --mux                  Embed subtitles into video file (soft subs)
+  --no-timestamps        Output plain text (.txt) instead of SRT subtitles (.srt)
   -h, --help             Show help message
 ```
 
@@ -150,12 +155,20 @@ Options:
 
 ## Output
 
-The tool generates an SRT file in the same directory as the input:
+By default, the tool generates an SRT file in the same directory as the input:
 
 ```
 input: /path/to/video.mp4
 output: /path/to/video.srt
 ```
+
+With `--no-timestamps`, it writes plain text instead:
+
+```
+output: /path/to/video.txt
+```
+
+With `--translate --save-original`, it also writes the untranslated version as `*.orig.srt` (or `*.orig.txt`).
 
 ### SRT Format Features
 
@@ -213,6 +226,11 @@ Translation adds ~$0.001-0.005/min depending on text length.
 ### Rate limiting
 - The tool automatically retries with exponential backoff
 - For large batches, add delays between files
+
+### Language code errors (Google models)
+- Google models expect BCP-47 language codes (e.g. `en-US`, `cmn-Hans-CN`)
+- If you see an error mentioning a specific location (e.g. `location named "us"`), try `--google-location eu`
+- If unsure, omit `--language` (auto-detect) or use `--model whisperx`
 
 ## License
 

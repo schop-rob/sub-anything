@@ -10,8 +10,9 @@ import time
 import os
 from pathlib import Path
 
+from .asr_models import ASR_MODELS
 from .models import Config
-from .utils import SUPPORTED_AUDIO_EXTENSIONS, SUPPORTED_VIDEO_EXTENSIONS
+from .utils import SUPPORTED_AUDIO_EXTENSIONS, SUPPORTED_VIDEO_EXTENSIONS, find_existing_original_transcript
 
 
 def _is_interactive() -> bool:
@@ -260,13 +261,12 @@ def run_wizard(
 
     input_path = _ask_input_file()
 
-    model = _pick_choice(
-        "Select model",
-        choices=available_models,
-        default="chirp3",
+    output_choice = _pick_choice(
+        "Output format",
+        choices=["SRT (timestamps)", "TXT (no timestamps)"],
+        default="SRT (timestamps)",
     )
-
-    no_timestamps = _ask_yes_no("Output plain text (no timestamps)?", default=False)
+    no_timestamps = output_choice.startswith("TXT")
 
     is_video = input_path.suffix.lower() in SUPPORTED_VIDEO_EXTENSIONS
     mux = False
@@ -277,6 +277,31 @@ def run_wizard(
             no_timestamps = False
 
     diarize = _ask_yes_no("Enable speaker diarization?", default=False)
+
+    timestamp_models = [
+        m for m in available_models if ASR_MODELS.get(m) and ASR_MODELS[m].can_provide_timestamps()
+    ]
+    text_models = [
+        m for m in available_models if ASR_MODELS.get(m) and ASR_MODELS[m].can_provide_plain_text()
+    ]
+    diarize_models = [
+        m for m in available_models if ASR_MODELS.get(m) and ASR_MODELS[m].can_diarize()
+    ]
+
+    candidates = text_models if no_timestamps else timestamp_models
+    if diarize:
+        candidates = [m for m in candidates if m in diarize_models]
+        if not candidates:
+            print("\nNo models match (output format + diarization).")
+            diarize = _ask_yes_no("Disable diarization and continue?", default=True)
+            if diarize:
+                diarize = False
+                candidates = text_models if no_timestamps else timestamp_models
+
+    if not candidates:
+        candidates = available_models
+
+    model = _pick_choice("Select model", choices=candidates, default="chirp3")
 
     language = _ask("Source language hint (auto, zh, en-US, cmn-Hans-CN, ...)", default="auto")
 
@@ -290,16 +315,36 @@ def run_wizard(
     translate_model = "gpt-4o-mini"
     translate_batch_size = 20
     save_original = False
+    reuse_original = False
+    regenerate_original = False
 
     if _ask_yes_no("Translate the transcript?", default=False):
         translate = _ask("Translate to language (e.g. en, es)", default="en")
         save_original = _ask_yes_no("Also save the original (untranslated) transcript?", default=True)
-        translate_model = _ask("Translation model", default=translate_model)
+        suggested_models = [
+            "gpt-5.2-chat-latest",
+            "gpt-5.2-pro",
+            "gpt-4o-mini",
+            "gpt-4o",
+            "custom (type model id)",
+        ]
+        choice = _pick_choice("Select translation model", suggested_models, default=translate_model)
+        if choice.startswith("custom"):
+            translate_model = _ask("Translation model id", default=translate_model)
+        else:
+            translate_model = choice
         translate_batch_size_raw = _ask("Translation batch size (smaller can reduce weird repeats)", default=str(translate_batch_size))
         try:
             translate_batch_size = int(translate_batch_size_raw)
         except ValueError:
             translate_batch_size = 20
+
+        output_ext = ".txt" if no_timestamps else ".srt"
+        existing_original = find_existing_original_transcript(input_path.with_suffix(output_ext))
+        if existing_original:
+            print(f"\nFound existing original transcript: {existing_original}")
+            reuse_original = _ask_yes_no("Reuse it and skip transcription?", default=True)
+            regenerate_original = not reuse_original
 
     verbose = _ask_yes_no("Verbose output?", default=False)
 
@@ -323,6 +368,10 @@ def run_wizard(
         cmd += ["--translate", translate, "--translate-model", translate_model, "--translate-batch-size", str(translate_batch_size)]
         if save_original:
             cmd.append("--save-original")
+        if reuse_original:
+            cmd.append("--reuse-original")
+        if regenerate_original:
+            cmd.append("--regenerate-original")
     if verbose:
         cmd.append("--verbose")
 
@@ -341,6 +390,8 @@ def run_wizard(
         translate_model=translate_model,
         translate_batch_size=translate_batch_size,
         save_original=save_original,
+        reuse_original=reuse_original,
+        regenerate_original=regenerate_original,
         diarize=diarize,
         language=language,
         mux=mux,

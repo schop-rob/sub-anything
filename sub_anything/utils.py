@@ -1,5 +1,6 @@
 """Utility functions for audio processing and SRT formatting."""
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -197,6 +198,156 @@ def format_srt_timestamp(seconds: float) -> str:
     secs = int(seconds % 60)
     millis = int((seconds % 1) * 1000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+_SRT_TS_RE = re.compile(r"^(?P<h>\d{2}):(?P<m>\d{2}):(?P<s>\d{2}),(?P<ms>\d{3})$")
+
+
+def parse_srt_timestamp(value: str) -> float:
+    """Parse an SRT timestamp (HH:MM:SS,mmm) into seconds."""
+    m = _SRT_TS_RE.match(value.strip())
+    if not m:
+        raise ValueError(f"Invalid SRT timestamp: {value!r}")
+    hours = int(m.group("h"))
+    minutes = int(m.group("m"))
+    secs = int(m.group("s"))
+    millis = int(m.group("ms"))
+    return (hours * 3600) + (minutes * 60) + secs + (millis / 1000.0)
+
+
+def original_transcript_candidates(output_transcript: Path) -> list[Path]:
+    """Return possible *.orig transcript paths for a given output transcript path."""
+    suffix = output_transcript.suffix.lower()
+    candidates = [output_transcript.with_suffix(f".orig{suffix}")]
+    if suffix == ".txt":
+        candidates.append(output_transcript.with_suffix(".orig.srt"))
+    return candidates
+
+
+def find_existing_original_transcript(output_transcript: Path) -> Path | None:
+    for candidate in original_transcript_candidates(output_transcript):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def load_segments_from_srt(path: Path) -> list[TranscriptSegment]:
+    """Load segments from an SRT file (best-effort)."""
+    with open(path, "r", encoding="utf-8") as f:
+        lines = [line.rstrip("\n") for line in f]
+
+    segments: list[TranscriptSegment] = []
+    i = 0
+
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line:
+            i += 1
+            continue
+
+        # Optional numeric index line
+        if line.isdigit():
+            i += 1
+            if i >= len(lines):
+                break
+            line = lines[i].strip()
+
+        if "-->" not in line:
+            i += 1
+            continue
+
+        parts = line.split("-->", 1)
+        try:
+            start = parse_srt_timestamp(parts[0].strip())
+            end = parse_srt_timestamp(parts[1].strip())
+        except ValueError:
+            i += 1
+            continue
+
+        i += 1
+        text_lines: list[str] = []
+        while i < len(lines) and lines[i].strip():
+            text_lines.append(lines[i].strip())
+            i += 1
+
+        raw_text = " ".join(text_lines).strip()
+        if not raw_text:
+            continue
+
+        confidence = 1.0
+        speaker = None
+        text = raw_text
+
+        if text.startswith("[?]"):
+            confidence = 0.0
+            text = text[3:].strip()
+
+        if text.startswith("[") and "]" in text:
+            label = text[1:text.index("]")]
+            if label and label != "?":
+                speaker = label
+                text = text[text.index("]") + 1 :].strip()
+
+        segments.append(
+            TranscriptSegment(
+                start_time=float(start),
+                end_time=float(end),
+                text=text,
+                confidence=confidence,
+                speaker=speaker,
+            )
+        )
+
+    return segments
+
+
+def load_segments_from_text(path: Path) -> list[TranscriptSegment]:
+    """Load segments from a plain text transcript (one segment per non-empty line)."""
+    with open(path, "r", encoding="utf-8") as f:
+        lines = [line.strip() for line in f]
+
+    segments: list[TranscriptSegment] = []
+    t = 0.0
+    for raw in lines:
+        if not raw:
+            continue
+
+        confidence = 1.0
+        speaker = None
+        text = raw
+
+        if text.startswith("[?]"):
+            confidence = 0.0
+            text = text[3:].strip()
+
+        if text.startswith("[") and "]" in text:
+            label = text[1:text.index("]")]
+            if label and label != "?":
+                speaker = label
+                text = text[text.index("]") + 1 :].strip()
+
+        segments.append(
+            TranscriptSegment(
+                start_time=t,
+                end_time=t + 1.0,
+                text=text,
+                confidence=confidence,
+                speaker=speaker,
+            )
+        )
+        t += 1.0
+
+    return segments
+
+
+def load_segments_from_transcript(path: Path) -> list[TranscriptSegment]:
+    """Load segments from either .srt or .txt transcript."""
+    suffix = path.suffix.lower()
+    if suffix == ".srt":
+        return load_segments_from_srt(path)
+    if suffix == ".txt":
+        return load_segments_from_text(path)
+    raise ValueError(f"Unsupported transcript format: {path}")
 
 
 def segments_to_srt(

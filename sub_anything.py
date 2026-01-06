@@ -25,13 +25,12 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).parent.resolve()
 CONFIG_FILE = SCRIPT_DIR / "config.json"
 
-AVAILABLE_MODELS = ["chirp3", "long", "whisperx"]
-
 # Cost estimates (USD per minute, approximate)
 COST_PER_MINUTE = {
     "chirp3": 0.016,
     "long": 0.016,
     "whisperx": 0.006,
+    "whisper": 0.006,
 }
 
 
@@ -112,6 +111,10 @@ def prompt_for_config(config):
 
 
 def main():
+    from sub_anything.asr_models import AVAILABLE_ASR_MODELS
+
+    available_models = AVAILABLE_ASR_MODELS
+
     parser = argparse.ArgumentParser(
         description="Transcribe audio/video to SRT subtitles",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -120,11 +123,16 @@ Models:
   chirp3   - Google Chirp 3: Best quality, 70+ languages, may have timestamp gaps
   long     - Google Long: Guaranteed timestamps, slightly less accurate
   whisperx - WhisperX (Replicate): Excellent timestamps, fast, good diarization
+  whisper  - OpenAI Whisper: Good quality, chunked for size limits (no diarization)
+  replicate-fast-whisper - Whisper large-v3 (Replicate): extremely fast
+  replicate-whisper      - OpenAI Whisper (Replicate): Whisper large-v3 with segments
 
 Examples:
   sub-anything                                   # Interactive wizard (TTY only)
   sub-anything video.mp4                          # Default (chirp3)
   sub-anything audio.mp3 --model whisperx         # Use WhisperX
+  sub-anything audio.mp3 --model whisper          # Use OpenAI Whisper
+  sub-anything audio.mp3 --model replicate-fast-whisper  # Fast Replicate Whisper
   sub-anything interview.wav --model whisperx --diarize  # With speakers
   sub-anything lecture.mp4 --translate es         # Translate to Spanish
   sub-anything movie.mkv --mux                    # Embed subtitles in video
@@ -132,14 +140,14 @@ Examples:
 Environment variables:
   GOOGLE_APPLICATION_CREDENTIALS  - Required for chirp3/long models
   REPLICATE_API_TOKEN             - Required for whisperx model
-  OPENAI_API_KEY                  - Required for --translate
+  OPENAI_API_KEY                  - Required for whisper model and --translate
   HF_TOKEN                        - Required for --diarize with whisperx
         """
     )
 
     parser.add_argument("input", type=Path, help="Input audio or video file")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
-    parser.add_argument("--model", choices=AVAILABLE_MODELS, default="chirp3",
+    parser.add_argument("--model", choices=available_models, default="chirp3",
                         help="Transcription model (default: chirp3)")
     parser.add_argument("--google-location", metavar="LOC",
                         help="Google Speech-to-Text location for chirp3/long (e.g., us, eu, asia-northeast1). "
@@ -152,6 +160,10 @@ Environment variables:
                         help="Subtitle segments per translation request (default: 20)")
     parser.add_argument("--save-original", action="store_true",
                         help="When using --translate, also save the original transcript as *.orig.srt/.orig.txt")
+    parser.add_argument("--reuse-original", action="store_true",
+                        help="If a matching *.orig.srt/.orig.txt already exists, skip transcription and only translate it")
+    parser.add_argument("--regenerate-original", action="store_true",
+                        help="If a matching *.orig.srt/.orig.txt already exists, regenerate it by re-transcribing")
     parser.add_argument("--diarize", action="store_true", help="Enable speaker diarization")
     parser.add_argument("--language", default="auto",
                         help="Source language hint (default: auto-detect)")
@@ -166,9 +178,17 @@ Environment variables:
             parser.print_help()
             sys.exit(2)
         from sub_anything.wizard import run_wizard
-        args = run_wizard(config_file=CONFIG_FILE, available_models=AVAILABLE_MODELS)
+        args = run_wizard(config_file=CONFIG_FILE, available_models=available_models)
     else:
         args = parser.parse_args()
+
+    if args.reuse_original and args.regenerate_original:
+        print("Error: --reuse-original and --regenerate-original are mutually exclusive")
+        sys.exit(2)
+
+    if (args.reuse_original or args.regenerate_original) and not args.translate:
+        print("Error: --reuse-original/--regenerate-original requires --translate")
+        sys.exit(2)
 
     # Check basic dependencies
     check_dependencies()
@@ -176,8 +196,9 @@ Environment variables:
     # Now import our modules (after checking tqdm is available)
     from tqdm import tqdm
     from sub_anything.models import Config
-    from sub_anything.providers import GoogleASRProvider, WhisperXProvider
-    from sub_anything.translator import TranslatorService
+    from sub_anything.asr_models import ASR_MODELS
+    from sub_anything.asr_models.google_base import GoogleSpeechV2ASRBase
+    from sub_anything.translation_models.openai import OpenAITranslationModel
     from sub_anything.utils import (
         SUPPORTED_VIDEO_EXTENSIONS,
         SUPPORTED_AUDIO_EXTENSIONS,
@@ -191,6 +212,9 @@ Environment variables:
         sanitize_segments,
         segments_to_srt,
         segments_to_text,
+        find_existing_original_transcript,
+        load_segments_from_transcript,
+        original_transcript_candidates,
         mux_subtitles,
     )
 
@@ -209,8 +233,38 @@ Environment variables:
         print(f"Supported audio: {', '.join(sorted(SUPPORTED_AUDIO_EXTENSIONS))}")
         sys.exit(1)
 
-    # Check ffmpeg
-    if not check_ffmpeg():
+    if args.mux and args.no_timestamps:
+        print("Error: --mux requires SRT output (remove --no-timestamps)")
+        sys.exit(1)
+
+    # Output paths
+    output_ext = ".txt" if args.no_timestamps else ".srt"
+    output_transcript = args.input.with_suffix(output_ext)
+    output_video = None
+    if args.mux and is_video:
+        output_video = args.input.with_stem(args.input.stem + "_subtitled")
+
+    # If an original transcript exists, offer to reuse it for translation-only runs.
+    existing_original = None
+    if args.translate:
+        existing_original = find_existing_original_transcript(output_transcript)
+
+    reuse_existing_original = False
+    if args.translate and existing_original and not args.regenerate_original:
+        if args.reuse_original:
+            reuse_existing_original = True
+        elif sys.stdin.isatty() and sys.stdout.isatty():
+            print(f"Found existing original transcript: {existing_original}")
+            answer = input("Reuse it and only run translation (skip transcription)? [Y/n]: ").strip().lower()
+            reuse_existing_original = answer in {"", "y", "yes"}
+
+    if args.reuse_original and not existing_original:
+        expected = ", ".join(str(p) for p in original_transcript_candidates(output_transcript))
+        print(f"Error: --reuse-original requested but no existing original transcript found (expected one of: {expected})")
+        sys.exit(1)
+
+    # Check ffmpeg only when needed.
+    if (args.mux or not reuse_existing_original) and not check_ffmpeg():
         print("Error: ffmpeg not found in PATH")
         print("Install ffmpeg:")
         print("  macOS:   brew install ffmpeg")
@@ -219,23 +273,27 @@ Environment variables:
         sys.exit(1)
 
     # Check model-specific requirements
-    use_google = args.model in ["chirp3", "long"]
-    use_replicate = args.model == "whisperx"
+    model_cls = ASR_MODELS[args.model]
+    use_google = issubclass(model_cls, GoogleSpeechV2ASRBase)
 
-    if use_google:
-        ok, error = GoogleASRProvider.check_requirements()
-        if not ok:
-            print(f"Error: {error}")
-            sys.exit(1)
+    if args.no_timestamps and not model_cls.can_provide_plain_text():
+        print(f"Error: model '{args.model}' does not support plain text output")
+        sys.exit(2)
+    if not args.no_timestamps and not model_cls.can_provide_timestamps():
+        print(f"Error: model '{args.model}' does not support timestamps/SRT output (try --no-timestamps)")
+        sys.exit(2)
+    if args.diarize and not reuse_existing_original and not model_cls.can_diarize():
+        print(f"Error: model '{args.model}' does not support speaker diarization")
+        sys.exit(2)
 
-    if use_replicate:
-        ok, error = WhisperXProvider.check_requirements()
+    if not reuse_existing_original:
+        ok, error = model_cls.check()
         if not ok:
             print(f"Error: {error}")
             sys.exit(1)
 
     if args.translate:
-        ok, error = TranslatorService.check_requirements()
+        ok, error = OpenAITranslationModel.check()
         if not ok:
             print(f"Error: {error}")
             sys.exit(1)
@@ -244,13 +302,47 @@ Environment variables:
         print("Error: --translate-batch-size must be between 1 and 100")
         sys.exit(1)
 
-    if args.mux and args.no_timestamps:
-        print("Error: --mux requires SRT output (remove --no-timestamps)")
-        sys.exit(1)
+    if reuse_existing_original:
+        print(f"Processing: {args.input.name}")
+        print(f"Model: {args.model} (skipped; using existing transcript)")
+
+        if existing_original is None:
+            print("Error: No existing original transcript found")
+            sys.exit(1)
+
+        segments = load_segments_from_transcript(existing_original)
+        if not segments:
+            print(f"Error: No segments found in {existing_original}")
+            sys.exit(1)
+
+        segments = sanitize_segments(segments)
+        print(f"Loaded {len(segments)} segments from {existing_original}")
+
+        print(f"Translating to {args.translate}...")
+        translator = OpenAITranslationModel(
+            model=args.translate_model,
+            batch_size=args.translate_batch_size,
+        )
+        segments = translator.translate(segments, args.translate, verbose=args.verbose)
+        segments = sanitize_segments(segments)
+
+        transcript_content = segments_to_text(segments) if args.no_timestamps else segments_to_srt(segments)
+        with open(output_transcript, "w", encoding="utf-8") as f:
+            f.write(transcript_content)
+        print(f"Saved: {output_transcript}")
+
+        if args.mux and is_video:
+            print("Embedding subtitles into video...")
+            mux_subtitles(args.input, output_transcript, output_video, verbose=args.verbose)
+            print(f"Saved: {output_video}")
+
+        print("\nEstimated cost: $0.000 (transcription skipped; translation not included)")
+        return
 
     # Load config for Google models
     config = None
     provider = None
+    google_location = None
 
     if use_google:
         config = Config.load(CONFIG_FILE)
@@ -264,25 +356,15 @@ Environment variables:
                 config.chirp_location = args.google_location
                 config.save(CONFIG_FILE)
         else:
-            google_location = args.google_location or "us-central1"
+            google_location = args.google_location or getattr(model_cls, "DEFAULT_LOCATION", "us-central1")
 
-        google_model = "chirp_3" if args.model == "chirp3" else "long"
-        provider = GoogleASRProvider(
+        provider = model_cls(
             project_id=config.project_id,
             gcs_bucket=config.gcs_bucket,
-            model=google_model,
             location=google_location,
         )
-    elif use_replicate:
-        provider = WhisperXProvider()
-        google_location = None
-
-    # Output paths
-    output_ext = ".txt" if args.no_timestamps else ".srt"
-    output_transcript = args.input.with_suffix(output_ext)
-    output_video = None
-    if args.mux and is_video:
-        output_video = args.input.with_stem(args.input.stem + "_subtitled")
+    else:
+        provider = model_cls()
 
     print(f"Processing: {args.input.name}")
     print(f"Model: {args.model}")
@@ -315,12 +397,28 @@ Environment variables:
         if args.verbose:
             print(f"Audio duration: {duration:.1f}s ({total_audio_minutes:.1f} min)")
 
-        # Step 2: Chunk if necessary (for long files)
-        needs_chunking = duration > MAX_CHUNK_DURATION_SECONDS
+        # Step 2: Chunk if necessary (model-dependent)
+        chunk_duration_seconds = int(getattr(model_cls, "default_chunk_duration_seconds", lambda: MAX_CHUNK_DURATION_SECONDS)())
+        chunk_overlap_seconds = int(getattr(model_cls, "default_chunk_overlap_seconds", lambda: CHUNK_OVERLAP_SECONDS)())
+
+        if chunk_duration_seconds <= 0:
+            chunk_duration_seconds = MAX_CHUNK_DURATION_SECONDS
+        if chunk_overlap_seconds < 0:
+            chunk_overlap_seconds = 0
+        if chunk_overlap_seconds >= chunk_duration_seconds:
+            chunk_overlap_seconds = max(0, chunk_duration_seconds - 1)
+
+        needs_chunking = duration > chunk_duration_seconds
 
         if needs_chunking:
-            print(f"Splitting into chunks ({int(duration // MAX_CHUNK_DURATION_SECONDS) + 1} chunks)...")
-            chunks = chunk_audio(audio_path, temp_path, verbose=args.verbose)
+            print(f"Splitting into chunks ({int(duration // chunk_duration_seconds) + 1} chunks)...")
+            chunks = chunk_audio(
+                audio_path,
+                temp_path,
+                chunk_duration=chunk_duration_seconds,
+                overlap=chunk_overlap_seconds,
+                verbose=args.verbose,
+            )
         else:
             chunks = [(audio_path, 0.0)]
 
@@ -347,7 +445,7 @@ Environment variables:
         # Step 4: Merge chunks
         if len(all_chunk_results) > 1:
             print("Merging chunks...")
-            segments = merge_chunk_segments(all_chunk_results, CHUNK_OVERLAP_SECONDS)
+            segments = merge_chunk_segments(all_chunk_results, chunk_overlap_seconds)
         else:
             segments = all_chunk_results[0][0] if all_chunk_results else []
 
@@ -379,7 +477,7 @@ Environment variables:
                 print(f"Saved: {orig_path}")
 
             print(f"Translating to {args.translate}...")
-            translator = TranslatorService(
+            translator = OpenAITranslationModel(
                 model=args.translate_model,
                 batch_size=args.translate_batch_size,
             )
@@ -405,7 +503,7 @@ Environment variables:
             print(f"Saved: {output_video}")
 
     # Cost estimate
-    cost_per_min = COST_PER_MINUTE.get(args.model, 0.01)
+    cost_per_min = getattr(provider, "COST_PER_MINUTE", COST_PER_MINUTE.get(args.model, 0.01))
     estimated_cost = total_audio_minutes * cost_per_min
     print(f"\nEstimated cost: ${estimated_cost:.3f} ({total_audio_minutes:.1f} min @ ${cost_per_min}/min)")
 

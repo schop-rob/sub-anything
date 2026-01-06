@@ -5,10 +5,11 @@ A command-line tool to transcribe any audio or video file to SRT subtitles using
 ## Features
 
 - **Multiple transcription backends** - Choose between Google Chirp 3, Google Long, or WhisperX (via Replicate)
+- **More Replicate providers** - Use Whisper large-v3 via Replicate (including an extremely fast variant)
 - **Multi-language support** - Auto-detect or specify source language (70+ languages with Chirp 3)
 - **Translation** - Translate subtitles to any language using OpenAI GPT
 - **Speaker diarization** - Label who is speaking in multi-speaker audio
-- **Smart chunking** - Automatically handles files longer than 1 hour with overlap merging
+- **Smart chunking** - Automatically segments long files with overlap merging
 - **Subtitle embedding** - Optionally mux subtitles directly into video files
 - **Word-level timestamps** - Accurate timing for subtitle synchronization
 - **Wizard mode** - Run `sub-anything` with no args for an interactive setup
@@ -56,7 +57,7 @@ ln -s "$(pwd)/sub-anything" /usr/local/bin/sub-anything
 |----------|--------------|-------------|
 | `GOOGLE_APPLICATION_CREDENTIALS` | chirp3, long | Path to Google Cloud service account JSON key |
 | `REPLICATE_API_TOKEN` | whisperx | Replicate API token |
-| `OPENAI_API_KEY` | --translate | OpenAI API key for translation |
+| `OPENAI_API_KEY` | whisper, --translate | OpenAI API key for transcription/translation |
 | `HF_TOKEN` | --diarize (whisperx) | HuggingFace token for speaker diarization |
 
 ### First Run Setup (Google models)
@@ -83,6 +84,15 @@ sub-anything podcast.mp3
 
 # Use WhisperX model (via Replicate)
 sub-anything audio.mp3 --model whisperx
+
+# Use Whisper large-v3 via Replicate (extremely fast)
+sub-anything audio.mp3 --model replicate-fast-whisper
+
+# Use OpenAI Whisper via Replicate
+sub-anything audio.mp3 --model replicate-whisper
+
+# Use OpenAI Whisper model
+sub-anything audio.mp3 --model whisper
 
 # Specify source language
 sub-anything lecture.mp4 --language en-US
@@ -137,13 +147,15 @@ sub-anything [OPTIONS] INPUT_FILE
 
 Options:
   -v, --verbose          Show detailed progress and debug info
-  --model MODEL          Transcription model: chirp3, long, whisperx (default: chirp3)
+  --model MODEL          Transcription model: chirp3, long, whisperx, whisper, replicate-fast-whisper, replicate-whisper (default: chirp3)
   --google-location LOC  Google Speech-to-Text location for chirp3/long (e.g., us, eu, asia-northeast1). Defaults: chirp3=eu, long=us-central1 (chirp3 is saved to config.json)
   --language LANG        Source language hint (default: auto)
   --translate LANG       Translate subtitles to target language
   --translate-model      OpenAI model for --translate (default: gpt-4o-mini)
   --translate-batch-size Subtitle segments per translation request (default: 20)
   --save-original        When using --translate, also save the original transcript as *.orig.srt/.orig.txt
+  --reuse-original       If a matching *.orig.srt/.orig.txt exists, skip transcription and only translate it
+  --regenerate-original  If a matching *.orig.srt/.orig.txt exists, regenerate it by re-transcribing
   --diarize              Enable speaker diarization
   --mux                  Embed subtitles into video file (soft subs)
   --no-timestamps        Output plain text (.txt) instead of SRT subtitles (.srt)
@@ -157,6 +169,9 @@ Options:
 | `chirp3` | Google Cloud | Best accuracy, 70+ languages, good for accents | May have occasional timestamp gaps |
 | `long` | Google Cloud | Guaranteed accurate timestamps | Slightly less accurate transcription |
 | `whisperx` | Replicate | Excellent timestamps, fast, great diarization | English-focused (supports others) |
+| `replicate-fast-whisper` | Replicate | Whisper large-v3, extremely fast | Limited language forcing, diarization needs `HF_TOKEN` |
+| `replicate-whisper` | Replicate | Whisper large-v3 with segments | No diarization |
+| `whisper` | OpenAI | Good quality, no GCS/Replicate needed | No diarization, chunked for upload limits |
 
 ### Model Selection Guide
 
@@ -164,6 +179,8 @@ Options:
 - **Guaranteed timestamps**: `long` - when subtitle timing is critical
 - **Interviews/meetings**: `whisperx --diarize` - best speaker separation
 - **Quick processing**: `whisperx` - fastest turnaround
+- **Super fast Whisper**: `replicate-fast-whisper` - fast + strong quality
+- **No Google/Replicate setup**: `whisper` - uses `OPENAI_API_KEY`
 
 ## Output
 
@@ -199,7 +216,7 @@ With `--translate --save-original`, it also writes the untranslated version as `
 ## How It Works
 
 1. **Audio Extraction** - Extracts audio from video files (skipped for audio-only inputs)
-2. **Chunking** - Splits files >1 hour into chunks with 10-second overlap
+2. **Chunking** - Splits long files into model-specific chunks with overlap
 3. **Upload** - Uploads audio to cloud storage (GCS for Google, direct for Replicate)
 4. **Transcription** - Sends to speech recognition API
 5. **Merging** - Combines chunks using confidence-based overlap resolution
@@ -216,6 +233,9 @@ Approximate costs per minute of audio:
 | chirp3 | ~$0.016 |
 | long | ~$0.016 |
 | whisperx | ~$0.006 |
+| replicate-fast-whisper | ~$0.006 |
+| replicate-whisper | ~$0.006 |
+| whisper | ~$0.006 |
 
 Translation adds ~$0.001-0.005/min depending on text length.
 

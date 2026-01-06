@@ -11,6 +11,7 @@ A command-line tool to transcribe any audio or video file to SRT subtitles using
 - **Smart chunking** - Automatically handles files longer than 1 hour with overlap merging
 - **Subtitle embedding** - Optionally mux subtitles directly into video files
 - **Word-level timestamps** - Accurate timing for subtitle synchronization
+- **Wizard mode** - Run `sub-anything` with no args for an interactive setup
 - **Cost estimation** - Shows estimated API cost after each run
 
 ## Installation
@@ -71,6 +72,9 @@ These are saved to `config.json` in the script directory.
 ### Basic Examples
 
 ```bash
+# Interactive wizard (TTY only)
+sub-anything
+
 # Transcribe a video (uses Chirp 3 by default)
 sub-anything video.mp4
 
@@ -85,6 +89,14 @@ sub-anything lecture.mp4 --language en-US
 
 # Auto-detect language (default)
 sub-anything foreign_film.mkv --language auto
+```
+
+### Wizard Mode
+
+Run with no arguments to launch an interactive wizard (TTY only) that asks for the file, model, language hints, translation options, etc:
+
+```bash
+sub-anything
 ```
 
 ### Translation
@@ -126,7 +138,7 @@ sub-anything [OPTIONS] INPUT_FILE
 Options:
   -v, --verbose          Show detailed progress and debug info
   --model MODEL          Transcription model: chirp3, long, whisperx (default: chirp3)
-  --google-location LOC  Google Speech-to-Text location for chirp3/long (e.g., us, eu, asia-northeast1)
+  --google-location LOC  Google Speech-to-Text location for chirp3/long (e.g., us, eu, asia-northeast1). Defaults: chirp3=eu, long=us-central1 (chirp3 is saved to config.json)
   --language LANG        Source language hint (default: auto)
   --translate LANG       Translate subtitles to target language
   --translate-model      OpenAI model for --translate (default: gpt-4o-mini)

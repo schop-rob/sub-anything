@@ -122,6 +122,7 @@ Models:
   whisperx - WhisperX (Replicate): Excellent timestamps, fast, good diarization
 
 Examples:
+  sub-anything                                   # Interactive wizard (TTY only)
   sub-anything video.mp4                          # Default (chirp3)
   sub-anything audio.mp3 --model whisperx         # Use WhisperX
   sub-anything interview.wav --model whisperx --diarize  # With speakers
@@ -142,7 +143,7 @@ Environment variables:
                         help="Transcription model (default: chirp3)")
     parser.add_argument("--google-location", metavar="LOC",
                         help="Google Speech-to-Text location for chirp3/long (e.g., us, eu, asia-northeast1). "
-                             "Defaults: chirp3=us, long=us-central1. When used with chirp3, it is saved to config.json.")
+                             "Defaults: chirp3=eu, long=us-central1. When used with chirp3, it is saved to config.json.")
     parser.add_argument("--translate", metavar="LANG",
                         help="Translate subtitles to language (e.g., 'en', 'es', 'zh')")
     parser.add_argument("--translate-model", default="gpt-4o-mini",
@@ -159,7 +160,15 @@ Environment variables:
     parser.add_argument("--no-timestamps", action="store_true",
                         help="Output plain text (.txt) instead of SRT subtitles (.srt)")
 
-    args = parser.parse_args()
+    # If invoked without args, run the interactive wizard instead of showing an argparse error.
+    if len(sys.argv) == 1:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            parser.print_help()
+            sys.exit(2)
+        from sub_anything.wizard import run_wizard
+        args = run_wizard(config_file=CONFIG_FILE, available_models=AVAILABLE_MODELS)
+    else:
+        args = parser.parse_args()
 
     # Check basic dependencies
     check_dependencies()
@@ -250,7 +259,7 @@ Environment variables:
 
         # Determine Google location
         if args.model == "chirp3":
-            google_location = args.google_location or config.chirp_location or "us"
+            google_location = args.google_location or config.chirp_location or "eu"
             if args.google_location and args.google_location != config.chirp_location:
                 config.chirp_location = args.google_location
                 config.save(CONFIG_FILE)

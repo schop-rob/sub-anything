@@ -22,7 +22,7 @@ class Config:
     """Persistent configuration."""
     gcs_bucket: str = ""
     project_id: str = ""
-    chirp_location: str = "us"
+    chirp_location: str = "eu"
 
     @classmethod
     def load(cls, config_file: Path) -> "Config":

@@ -46,7 +46,7 @@ class GoogleASRProvider(ASRProvider):
         project_id: str,
         gcs_bucket: str,
         model: str = "chirp_3",  # "chirp_3" or "long"
-        location: str = "us",
+        location: str = "eu",
     ):
         self.project_id = project_id
         self.gcs_bucket = gcs_bucket
